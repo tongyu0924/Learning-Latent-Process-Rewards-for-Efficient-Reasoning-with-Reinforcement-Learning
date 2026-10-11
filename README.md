@@ -134,7 +134,7 @@ Shared settings:
 
 Evaluated on GSM8K, MathQA and MATH, with SFT-r8 / SFT-r32 as references.
 
-## Usage (Colab, A100 recommended)
+## Usage
 
 ```bash
 !git clone https://github.com/tongyu0924/latent-reward-rl
