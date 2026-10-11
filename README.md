@@ -114,12 +114,16 @@ Evaluation uses greedy decoding with dropout off, and reports pass@1 and average
 
 ## Experiments
 
-| Variant | Update | Baseline | $\lambda$ |
-|---|---|---|---|
-| `outcome` | token-level GRPO (clip + KL) | group mean | 0 |
-| `slpo` | surrogate latent policy | RLOO | 0 |
-| `slpo_value` | surrogate latent policy | $V_\phi$ | 0 |
-| `slpo_value_cost` | surrogate latent policy | $V_\phi$ | 0.1 |
+`slpo_value_cost` is the full method. The other rows are ablations that each remove one component, so the effect of each part can be measured separately.
+
+| Variant | Role | Update | Baseline | Step cost $\lambda$ |
+|---|---|---|---|---|
+| `outcome` | token-level RL baseline | token-level GRPO (clip + KL) | group mean | – |
+| `slpo` | ablation: no value, no cost | surrogate latent policy | RLOO | – |
+| `slpo_value` | ablation: no cost | surrogate latent policy | $V_\phi$ | – |
+| **`slpo_value_cost`** | **full method** | surrogate latent policy | $V_\phi$ | **0.1** |
+
+Reading the table: `slpo` vs `outcome` isolates latent-level updates, `slpo_value` vs `slpo` isolates the value baseline, and `slpo_value_cost` vs `slpo_value` isolates the step cost (compare both accuracy and latent steps).
 
 Shared settings:
 

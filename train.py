@@ -16,11 +16,12 @@ CFG = None
 DEVICE = H.DEVICE
 LOG2PI = math.log(2 * math.pi)
 
+# lam=None -> cfg.step_cost_lambda. `slpo_value_cost` is the full method; the others are ablations.
 VARIANTS = {
     "outcome":         dict(name="RL-Outcome",  kind="grpo", baseline="mean",  lam=0.0),
     "slpo":            dict(name="SLPO",        kind="slpo", baseline="rloo",  lam=0.0),
     "slpo_value":      dict(name="SLPO+V",      kind="slpo", baseline="value", lam=0.0),
-    "slpo_value_cost": dict(name="SLPO+V+cost", kind="slpo", baseline="value", lam=None),  # None -> cfg
+    "slpo_value_cost": dict(name="SLPO+V+cost", kind="slpo", baseline="value", lam=None),
 }
 
 
