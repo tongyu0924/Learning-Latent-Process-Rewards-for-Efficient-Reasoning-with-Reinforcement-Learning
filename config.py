@@ -52,7 +52,7 @@ class Config:
     value_lr: float = 1e-4
     value_warmup_updates: int = 2
 
-    # latent scorer (SWIFT-style)
+    # latent scorer
     use_scorer: bool = True
     scorer_path: str | None = None     # load a trained scorer instead of training one
     scorer_n_train: int = 1000         # GSM8K train problems, disjoint from the RL subset

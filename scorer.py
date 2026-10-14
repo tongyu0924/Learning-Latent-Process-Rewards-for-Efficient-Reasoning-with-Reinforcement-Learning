@@ -1,4 +1,4 @@
-"""SWIFT-style latent scorer: reads Huginn's refinement states h_{j,1..r}, learns per-token gates and scores,
+"""Latent scorer: reads Huginn's refinement states h_{j,1..r}, learns per-token gates and scores,
 aggregates them into one trajectory score S, and is trained with BCE on final-answer correctness."""
 import json
 import os

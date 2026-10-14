@@ -96,7 +96,7 @@ $$
 
 That is, $\nabla_\theta J \approx A \cdot \nabla_\theta \log \tilde\pi_\theta(z, y \mid x)$.
 
-### 5. Latent scorer (SWIFT-style)
+### 5. Latent scorer
 
 For the position that predicts answer token $j$, concatenate the $r$ refinement states:
 
@@ -104,10 +104,10 @@ $$
 u_{i,j} = \big[h_{i,j,1};\ \dots;\ h_{i,j,r}\big] \in \mathbb R^{rd}
 $$
 
-A single linear map gives a gate and a score per token:
+A single linear map $W \in \mathbb R^{2 \times rd}$ gives a gate and a score per token:
 
 $$
-\begin{bmatrix} \tilde g_{i,j} \\ s_{i,j} \end{bmatrix} = W u_{i,j} + b, \qquad g_{i,j} = \sigma(\tilde g_{i,j})
+\tilde g_{i,j} = w_g^\top u_{i,j} + b_g, \qquad s_{i,j} = w_s^\top u_{i,j} + b_s, \qquad g_{i,j} = \sigma(\tilde g_{i,j})
 $$
 
 Gated average over answer positions:
@@ -207,7 +207,7 @@ Outputs go to `outputs/`:
 | `config.py` | hyperparameters |
 | `data.py` | dataset loading, answer extraction and scoring |
 | `huginn.py` | model loading, padded attention, MC-dropout, latent capture, generation |
-| `scorer.py` | SWIFT-style latent scorer: training, validation, best-of-N |
+| `scorer.py` | latent scorer: training, validation, best-of-N |
 | `train.py` | reward, SLPO loss, value baseline, training and evaluation |
 
 ## Notes
