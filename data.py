@@ -35,6 +35,10 @@ def num_equal(a, b, tol=1e-4):
     return a is not None and b is not None and abs(a - b) <= tol * max(1.0, abs(b))
 
 
+def gsm_correct(text, gold):
+    return 1.0 if num_equal(extract_pred_number(text), norm_num(gold)) else 0.0
+
+
 def last_boxed(s):
     idx = s.rfind("\\boxed")
     if idx < 0:
@@ -162,3 +166,16 @@ def score_item(name, text, item):
     if name == "math":
         return item["gold"] is not None and norm_math(last_boxed(text)) == item["gold"]
     return False
+
+
+def extract_answer(name, text):
+    """Canonical answer string, used for majority voting."""
+    if name == "gsm8k":
+        v = extract_pred_number(text)
+        return None if v is None else f"{v:.4f}"
+    if name == "mathqa":
+        m = re.findall(r"answer is\s*:?\s*\(?([a-e])\)?", text, flags=re.I)
+        return m[-1].lower() if m else None
+    if name == "math":
+        return norm_math(last_boxed(text))
+    return None

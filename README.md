@@ -1,9 +1,10 @@
 # Learning Latent Process Rewards for Efficient Reasoning with Reinforcement Learning
 
 Outcome-reward RL on the continuous latent transitions of a latent-recurrent LM ([Huginn-3.5B](https://huggingface.co/tomg-group-umd/huginn-0125)).
-No external LLM grader and no latent-to-text decoding: the only training signal is whether the final answer is correct.
+No external LLM grader and no latent-to-text decoding: the verifiable signal is whether the final answer is correct, optionally complemented by a learned scorer that reads the latent refinement states.
 
 - Method: surrogate latent policy from SLPO ([arXiv:2607.19691](https://arxiv.org/abs/2607.19691))
+- Latent scorer: adapted from SWIFT ([arXiv:2505.12225](https://arxiv.org/abs/2505.12225)), with refinement states in place of layers
 - Experimental setup follows LSRL ([Findings of EMNLP 2025](https://aclanthology.org/2025.findings-emnlp.669.pdf))
 
 ## Algorithm
@@ -95,12 +96,49 @@ $$
 
 That is, $\nabla_\theta J \approx A \cdot \nabla_\theta \log \tilde\pi_\theta(z, y \mid x)$.
 
+### 5. Latent scorer (SWIFT-style)
+
+For the position that predicts answer token $j$, concatenate the $r$ refinement states:
+
+$$
+u_{i,j} = \big[h_{i,j,1};\ \dots;\ h_{i,j,r}\big] \in \mathbb R^{rd}
+$$
+
+A single linear map gives a gate and a score per token:
+
+$$
+\begin{bmatrix} \tilde g_{i,j} \\ s_{i,j} \end{bmatrix} = W u_{i,j} + b, \qquad g_{i,j} = \sigma(\tilde g_{i,j})
+$$
+
+Gated average over answer positions:
+
+$$
+S_i = \frac{\sum_j g_{i,j}\, s_{i,j}}{\max\big(\sum_j g_{i,j},\ \epsilon\big)}
+$$
+
+Trained on detached states with final-answer labels, on GSM8K problems disjoint from the RL subset:
+
+$$
+c_i = \mathbf 1\big[\text{Answer}(y_i) = a\big], \qquad \mathcal L_{\text{score}} = \mathrm{BCEWithLogits}(S_i,\ c_i)
+$$
+
+The scorer is then frozen and used in two ways:
+
+- **Best-of-N:** sample $N$ answers and return $\arg\max_i S_i$. The RL reward is unchanged.
+- **Extra reward:** add the scorer's prediction to the verifiable reward:
+
+$$
+R'_i = c_i - \lambda \frac{n_i}{N_{\max}} + \eta\, \sigma(S_i)
+$$
+
 ### Loop
 
 ```
+train latent scorer on base-model rollouts (detached states, BCE on correctness), then freeze it
+
 for each batch (32 problems, G = 8 rollouts each):
     rollout with dropout on; store y and every h_{t,k}
-    r' = 1[correct] − λ·T/T_max
+    r' = 1[correct] − λ·T/T_max   (+ η·σ(S) for the scorer variant)
     A  = r' − b                 # b = RLOO or V_φ
     for k = 1..r:
         re-run core K times from sg(h_{t,k−1}) → μ, σ²
@@ -122,8 +160,14 @@ Evaluation uses greedy decoding with dropout off, and reports pass@1 and average
 | `slpo` | ablation: no value, no cost | surrogate latent policy | RLOO | – |
 | `slpo_value` | ablation: no cost | surrogate latent policy | $V_\phi$ | – |
 | **`slpo_value_cost`** | **full method** | surrogate latent policy | $V_\phi$ | **0.1** |
+| `slpo_value_cost_scorer` | extension: + latent scorer reward | surrogate latent policy | $V_\phi$ | 0.1, $\eta = 0.2$ |
 
-Reading the table: `slpo` vs `outcome` isolates latent-level updates, `slpo_value` vs `slpo` isolates the value baseline, and `slpo_value_cost` vs `slpo_value` isolates the step cost (compare both accuracy and latent steps).
+Reading the table: `slpo` vs `outcome` isolates latent-level updates, `slpo_value` vs `slpo` isolates the value baseline, `slpo_value_cost` vs `slpo_value` isolates the step cost (compare both accuracy and latent steps), and `slpo_value_cost_scorer` vs `slpo_value_cost` isolates the scorer reward.
+
+Latent scorer evaluation:
+
+- **Held-out validation:** AUC and BCE on 200 GSM8K train problems not used elsewhere.
+- **Best-of-8 on GSM8K test:** scorer pick vs. majority vote vs. mean sample accuracy vs. oracle (any correct). Run on the base model and after `slpo_value_cost` / `slpo_value_cost_scorer`.
 
 Shared settings:
 
@@ -131,18 +175,21 @@ Shared settings:
 - $r = 8$, $G = 8$, $K = 4$, dropout $p = 0.1$
 - LoRA rank 8 / α 16, core only
 - lr = 2e-6, 32 problems per update
+- Scorer: 1000 GSM8K train problems × 8 rollouts, 2 epochs, AdamW (lr 1e-4, wd 1e-5)
 
 Evaluated on GSM8K, MathQA and MATH, with SFT-r8 / SFT-r32 as references.
 
 ## Usage
 
 ```bash
-!git clone https://github.com/tongyu0924/latent-reward-rl
-%cd latent-reward-rl
+!git clone https://github.com/tongyu0924/Learning-Latent-Process-Rewards-for-Efficient-Reasoning-with-Reinforcement-Learning
+%cd Learning-Latent-Process-Rewards-for-Efficient-Reasoning-with-Reinforcement-Learning
 !pip install -q -r requirements.txt
 !python train.py --preset quick                       # smoke test
 !python train.py                                      # full run
 !python train.py --variants slpo slpo_value           # subset of variants
+!python train.py --scorer_path outputs/latent_scorer.pt  # reuse a trained scorer
+!python train.py --no_scorer                          # skip the scorer entirely
 ```
 
 Outputs go to `outputs/`:
@@ -150,7 +197,8 @@ Outputs go to `outputs/`:
 - `results.json`
 - `train_*.json`: training logs
 - `eval_*.jsonl`: evaluation records
-- LoRA adapters and $V_\phi$ weights
+- `bon_*.jsonl`: best-of-N records
+- LoRA adapters, $V_\phi$ weights and `latent_scorer.pt`
 
 ## Files
 
@@ -159,6 +207,7 @@ Outputs go to `outputs/`:
 | `config.py` | hyperparameters |
 | `data.py` | dataset loading, answer extraction and scoring |
 | `huginn.py` | model loading, padded attention, MC-dropout, latent capture, generation |
+| `scorer.py` | SWIFT-style latent scorer: training, validation, best-of-N |
 | `train.py` | reward, SLPO loss, value baseline, training and evaluation |
 
 ## Notes
@@ -167,3 +216,5 @@ Outputs go to `outputs/`:
 - **Dropout:** Huginn was pretrained without dropout, so keep $p$ small.
 - **Token term uses $\mu_{t,r}$:** LoRA lives only in the core, so the token term uses the recomputed $\mu_{t,r}$ to let gradients reach it.
 - **Large λ:** a large $\lambda$ encourages stopping too early; check acc and steps together.
+- **Scorer reward:** $S_i$ scores the whole trajectory from its latents; it is not a reliable per-refinement correctness score. The policy can learn to please the scorer, so validate the scorer (AUC, best-of-N) before trusting the `slpo_value_cost_scorer` results, and keep $\eta$ small.
+- **Scorer distribution shift:** the scorer is trained on base-model states. Half of its training batches use MC-dropout so it also sees RL-style rollouts, but LoRA updates still shift the states during RL.

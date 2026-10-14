@@ -11,7 +11,7 @@ class Config:
     # experiments
     eval_sft_r8: bool = True
     eval_sft_r32: bool = True
-    train_variants: tuple = ("outcome", "slpo", "slpo_value", "slpo_value_cost")
+    train_variants: tuple = ("outcome", "slpo", "slpo_value", "slpo_value_cost", "slpo_value_cost_scorer")
     eval_datasets: tuple = ("gsm8k", "mathqa", "math")
     eval_limit: int | None = None
     eval_batch_size: int = 16          # at r=8; scaled down automatically for deeper r
@@ -52,6 +52,29 @@ class Config:
     value_lr: float = 1e-4
     value_warmup_updates: int = 2
 
+    # latent scorer (SWIFT-style)
+    use_scorer: bool = True
+    scorer_path: str | None = None     # load a trained scorer instead of training one
+    scorer_n_train: int = 1000         # GSM8K train problems, disjoint from the RL subset
+    scorer_n_val: int = 200
+    scorer_G: int = 8
+    scorer_epochs: int = 2             # each epoch draws fresh rollouts
+    scorer_prompts_per_batch: int = 8
+    scorer_inner_steps: int = 4
+    scorer_micro_bs: int = 8
+    scorer_lr: float = 1e-4
+    scorer_wd: float = 1e-5
+    scorer_max_pos_weight: float = 10.0
+    scorer_dropout_mix: float = 0.5    # fraction of scorer batches sampled with MC-dropout (matches RL rollouts)
+    scorer_eta: float = 0.2            # weight of sigma(S) in the RL reward
+
+    # best-of-N evaluation with the scorer
+    bon_n: int = 8
+    bon_datasets: tuple = ("gsm8k",)
+    bon_limit: int | None = 500
+    bon_prompts_per_batch: int = 4
+    bon_after_variants: tuple = ("slpo_value_cost", "slpo_value_cost_scorer")
+
     # LoRA (recurrent core only)
     lora_r: int = 8
     lora_alpha: int = 16
@@ -75,4 +98,10 @@ def get_config(preset="paper"):
         cfg.eval_datasets = ("gsm8k",)
         cfg.r_deep = 16
         cfg.train_max_new_tokens = 160
+        cfg.scorer_n_train = 16
+        cfg.scorer_n_val = 8
+        cfg.scorer_G = 4
+        cfg.scorer_epochs = 1
+        cfg.bon_n = 4
+        cfg.bon_limit = 16
     return cfg

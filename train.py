@@ -1,4 +1,4 @@
-"""Reward-based latent RL on Huginn: SLPO surrogate + RLOO / latent-value baseline + step cost."""
+"""Reward-based latent RL on Huginn: SLPO surrogate + RLOO / latent-value baseline + step cost + latent scorer."""
 import argparse
 import json
 import math
@@ -9,19 +9,22 @@ import time
 import torch
 
 import huginn as H
+import scorer as SC
 from config import get_config
-from data import GSM_SUFFIX, extract_pred_number, load_eval_sets, load_gsm8k, norm_num, num_equal, score_item
+from data import GSM_SUFFIX, gsm_correct, load_eval_sets, load_gsm8k, score_item
 
 CFG = None
+SCORER = None
 DEVICE = H.DEVICE
 LOG2PI = math.log(2 * math.pi)
 
-# lam=None -> cfg.step_cost_lambda. `slpo_value_cost` is the full method; the others are ablations.
+# lam=None -> cfg.step_cost_lambda; scorer=True adds eta * sigma(S) from the frozen latent scorer.
 VARIANTS = {
-    "outcome":         dict(name="RL-Outcome",  kind="grpo", baseline="mean",  lam=0.0),
-    "slpo":            dict(name="SLPO",        kind="slpo", baseline="rloo",  lam=0.0),
-    "slpo_value":      dict(name="SLPO+V",      kind="slpo", baseline="value", lam=0.0),
-    "slpo_value_cost": dict(name="SLPO+V+cost", kind="slpo", baseline="value", lam=None),
+    "outcome":                dict(name="RL-Outcome",    kind="grpo", baseline="mean",  lam=0.0),
+    "slpo":                   dict(name="SLPO",          kind="slpo", baseline="rloo",  lam=0.0),
+    "slpo_value":             dict(name="SLPO+V",        kind="slpo", baseline="value", lam=0.0),
+    "slpo_value_cost":        dict(name="SLPO+V+cost",   kind="slpo", baseline="value", lam=None),
+    "slpo_value_cost_scorer": dict(name="SLPO+V+cost+S", kind="slpo", baseline="value", lam=None, scorer=True),
 }
 
 
@@ -30,8 +33,7 @@ def log(*a):
 
 
 # ---------------- reward ----------------
-def correct_reward(text, gold):
-    return 1.0 if num_equal(extract_pred_number(text), norm_num(gold)) else 0.0
+correct_reward = gsm_correct
 
 
 def shaped_reward(correct, n_tokens, lam):
@@ -176,6 +178,10 @@ def train_variant(peft_model, variant, train_items):
     spec = VARIANTS[variant]
     is_slpo = spec["kind"] == "slpo"
     lam = CFG.step_cost_lambda if spec["lam"] is None else spec["lam"]
+    use_scorer = spec.get("scorer", False)
+    if use_scorer and SCORER is None:
+        log(f"skip {variant}: no latent scorer")
+        return False
     vhead = vopt = None
     if spec["baseline"] == "value":
         vhead = LatentValueHead(H.model.config.n_embd, CFG.value_hidden).to(DEVICE)
@@ -183,7 +189,7 @@ def train_variant(peft_model, variant, train_items):
 
     peft_model.set_adapter(variant)
     params = [p for n, p in peft_model.named_parameters() if p.requires_grad and f".{variant}." in n]
-    log(f"### {variant} | baseline={spec['baseline']} lambda={lam} | trainable={sum(p.numel() for p in params):,}")
+    log(f"### {variant} | baseline={spec['baseline']} lambda={lam} scorer={use_scorer} | trainable={sum(p.numel() for p in params):,}")
     opt = torch.optim.AdamW(params, lr=CFG.lr, weight_decay=0.0)
     beta, hist, step = CFG.beta_init, [], 0
     per_update = CFG.prompts_per_micro * CFG.grad_accum
@@ -197,7 +203,7 @@ def train_variant(peft_model, variant, train_items):
             upd = [train_items[i] for i in order[u0:u0 + per_update]]
             n_norm = len(upd) * CFG.G
             use_value = vhead is not None and step >= CFG.value_warmup_updates
-            st = {k: [] for k in ("R", "acc", "T", "kl", "lat", "tok", "vloss", "base")}
+            st = {k: [] for k in ("R", "acc", "T", "S", "kl", "lat", "tok", "vloss", "base")}
             opt.zero_grad(set_to_none=True)
 
             for m0 in range(0, len(upd), CFG.prompts_per_micro):
@@ -219,6 +225,11 @@ def train_variant(peft_model, variant, train_items):
                     comps = comps_all[sl]
                     corr = [correct_reward(H.decode(c), it["answer"]) for c in comps]
                     R = [shaped_reward(corr[g], len(comps[g]), lam) for g in range(CFG.G)]
+                    if use_scorer:   # R' = c - lam*n/N_max + eta*sigma(S)
+                        S = SCORER.score(states_all[sl], len(p_ids[j]), [len(c) for c in comps])
+                        sig = [1 / (1 + math.exp(-x)) for x in S]
+                        R = [R[g] + CFG.scorer_eta * sig[g] for g in range(CFG.G)]
+                        st["S"] += sig
                     A = advantages(R, "mean" if spec["kind"] == "grpo" else "rloo")
                     st["R"] += R
                     st["acc"] += corr
@@ -255,6 +266,8 @@ def train_variant(peft_model, variant, train_items):
                        grad_norm=gn, sec=time.time() - t0)
             if is_slpo:
                 rec.update(lat=avg(st["lat"]), tok=avg(st["tok"]), base=avg(st["base"]), vloss=avg(st["vloss"]))
+                if use_scorer:
+                    rec["scorer_p"] = avg(st["S"])
             else:
                 rec["kl"] = avg(st["kl"])
                 beta = max(1e-4, beta * (1 + max(-0.2, min(0.2, rec["kl"] / CFG.kl_target - 1))))
@@ -266,6 +279,7 @@ def train_variant(peft_model, variant, train_items):
     if vhead is not None:
         torch.save(vhead.state_dict(), os.path.join(CFG.out_dir, f"value_{variant}.pt"))
     json.dump(hist, open(os.path.join(CFG.out_dir, f"train_{variant}.json"), "w"), indent=1)
+    return True
 
 
 # ---------------- evaluation ----------------
@@ -298,21 +312,32 @@ def print_table(results, cols):
 
 # ---------------- main ----------------
 def main():
-    global CFG
+    global CFG, SCORER
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="paper", choices=["paper", "quick"])
     ap.add_argument("--variants", nargs="*", default=None, choices=list(VARIANTS))
+    ap.add_argument("--no_scorer", action="store_true")
+    ap.add_argument("--scorer_path", default=None)
     args = ap.parse_args()
     CFG = get_config(args.preset)
-    if args.variants:
+    if args.variants is not None:
         CFG.train_variants = tuple(args.variants)
+    if args.no_scorer:
+        CFG.use_scorer = False
+    if args.scorer_path:
+        CFG.scorer_path = args.scorer_path
     os.makedirs(CFG.out_dir, exist_ok=True)
     random.seed(CFG.seed)
     torch.manual_seed(CFG.seed)
 
     H.load_model(CFG.model_id)
     gsm_train, _ = load_gsm8k()
-    train_items = [gsm_train[i] for i in random.Random(CFG.seed).sample(range(len(gsm_train)), CFG.n_train)]
+    perm = random.Random(CFG.seed).sample(range(len(gsm_train)), len(gsm_train))
+    train_items = [gsm_train[i] for i in perm[:CFG.n_train]]
+    # scorer data is disjoint from the RL subset
+    rest = perm[CFG.n_train:]
+    scorer_train = [gsm_train[i] for i in rest[:CFG.scorer_n_train]]
+    scorer_val = [gsm_train[i] for i in rest[CFG.scorer_n_train:CFG.scorer_n_train + CFG.scorer_n_val]]
     eval_sets = load_eval_sets(CFG.eval_datasets)
     log("eval sets:", {k: len(v) for k, v in eval_sets.items()})
 
@@ -322,6 +347,18 @@ def main():
         results[f"SFT-r{CFG.r}"] = run_eval(f"sft_r{CFG.r}", CFG.r)
     if CFG.eval_sft_r32:
         results[f"SFT-r{CFG.r_deep}"] = run_eval(f"sft_r{CFG.r_deep}", CFG.r_deep)
+
+    # latent scorer: trained on the base model's refinement states, then frozen
+    bon_results = {}
+    bon_sets = {n: it for n, it in eval_sets.items() if n in CFG.bon_datasets}
+    run_bon = lambda tag: {n: SC.evaluate_best_of_n(CFG, SCORER, n, it, tag) for n, it in bon_sets.items()}  # noqa
+    if CFG.use_scorer:
+        if CFG.scorer_path:
+            SCORER = SC.load_scorer(CFG, CFG.scorer_path)
+        else:
+            SCORER = SC.train_scorer(CFG, scorer_train, scorer_val)
+        results["scorer_val"] = SC.validate_scorer(CFG, SCORER, scorer_val)
+        bon_results[f"SFT-r{CFG.r}"] = run_bon(f"sft_r{CFG.r}")
 
     from peft import LoraConfig, get_peft_model
     lcfg = LoraConfig(r=CFG.lora_r, lora_alpha=CFG.lora_alpha, lora_dropout=CFG.lora_dropout, bias="none",
@@ -334,11 +371,21 @@ def main():
             peft_model.add_adapter(v, lcfg)
 
     for v in CFG.train_variants:
-        train_variant(peft_model, v, train_items)
+        if not train_variant(peft_model, v, train_items):
+            continue
         peft_model.set_adapter(v)
-        results[f"{VARIANTS[v]['name']}-r{CFG.r}"] = run_eval(f"{v}_r{CFG.r}", CFG.r)
+        name = f"{VARIANTS[v]['name']}-r{CFG.r}"
+        results[name] = run_eval(f"{v}_r{CFG.r}", CFG.r)
+        if SCORER is not None and v in CFG.bon_after_variants:
+            bon_results[name] = run_bon(f"{v}_r{CFG.r}")
 
-    print_table(results, list(eval_sets))
+    print_table({k: v for k, v in results.items() if k != "scorer_val"}, list(eval_sets))
+    if bon_results:
+        print(f"\nBest-of-{CFG.bon_n} (scorer / majority / mean / oracle)")
+        for name, res in bon_results.items():
+            for n, r_ in res.items():
+                print(f"{name:<20}{n:>8}  " + "  ".join(f"{r_[k]:6.2f}" for k in ("scorer", "majority", "mean", "oracle")))
+    results["best_of_n"] = bon_results
     json.dump(results, open(os.path.join(CFG.out_dir, "results.json"), "w"), indent=2)
 
 
