@@ -198,7 +198,7 @@ Baseline rows are taken from LSRL ([Findings of EMNLP 2025](https://aclanthology
 | RL-Outcome | 8 | 14.54 | 6.32 | 24.62 | 1.0× |
 | LSRL | 8 | 17.76 | 6.94 | 26.13 | 1.0× |
 | SFT-r32 (reference) | 32 | 24.87 | 11.24 | 27.97 | 4.0× |
-| **Ours (SLPO + $V_\phi$ + step cost)** | 8 | | | | 1.0× |
+| **Ours (SLPO + $V_\phi$ + step cost)** | 8 | 27.12 | 16.65 | 28.95 | 1.0× |
 
 ### Ablations (GSM8K, pass@1 % and average latent steps $\bar T$)
 
