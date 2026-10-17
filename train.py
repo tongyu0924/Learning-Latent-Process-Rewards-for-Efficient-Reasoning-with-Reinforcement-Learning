@@ -11,7 +11,7 @@ import torch
 import huginn as H
 import scorer as SC
 from config import get_config
-from data import GSM_SUFFIX, gsm_correct, load_eval_sets, load_gsm8k, score_item
+from data import GSM_SUFFIX, gsm_correct, load_eval_sets, load_gsm8k, make_eval_items, score_item
 
 CFG = None
 SCORER = None
@@ -25,6 +25,29 @@ VARIANTS = {
     "slpo_value":             dict(name="SLPO+V",        kind="slpo", baseline="value", lam=0.0),
     "slpo_value_cost":        dict(name="SLPO+V+cost",   kind="slpo", baseline="value", lam=None),
     "slpo_value_cost_scorer": dict(name="SLPO+V+cost+S", kind="slpo", baseline="value", lam=None, scorer=True),
+    # ablation-only variants: same reward as the full method (with step cost), one component swapped
+    "outcome_cost":           dict(name="TokenGRPO+cost", kind="grpo", baseline="mean",  lam=None),
+    "slpo_cost":              dict(name="SLPO+RLOO+cost", kind="slpo", baseline="rloo",  lam=None),
+}
+FULL = "slpo_value_cost"
+
+# Each ablation removes ONE component of the full method (slpo_value_cost).
+ABLATIONS = {
+    "latent": dict(variant="outcome_cost", title="latent-level SLPO update -> token-level GRPO",
+                   question="Does policy gradient on the latent transitions beat token-level RL with the same reward?"),
+    "value":  dict(variant="slpo_cost", title="latent value baseline V_phi -> RLOO",
+                   question="Does the learned latent value baseline help compared with a leave-one-out baseline?"),
+    "cost":   dict(variant="slpo_value", title="step cost lambda=0.1 -> lambda=0",
+                   question="Does the step cost shorten reasoning (fewer latent steps) while keeping accuracy?"),
+}
+
+# Reported numbers (pass@1 %, greedy) from LSRL, Findings of EMNLP 2025, Table 3, Huginn-3.5B.
+# https://aclanthology.org/2025.findings-emnlp.669.pdf  (full test sets, their own eval pipeline)
+PAPER_BASELINES = {
+    "SFT-r8":     {"r": 8,  "gsm8k": 13.49, "math": 5.61,  "mathqa": 24.07},
+    "RL-Outcome": {"r": 8,  "gsm8k": 14.54, "math": 6.32,  "mathqa": 24.62},
+    "LSRL":       {"r": 8,  "gsm8k": 17.76, "math": 6.94,  "mathqa": 26.13},
+    "SFT-r32":    {"r": 32, "gsm8k": 24.87, "math": 11.24, "mathqa": 27.97},
 }
 
 
@@ -87,7 +110,7 @@ def _value_step(vhead, vopt, feats, Rp, mask):
     vopt.zero_grad(set_to_none=True)
     loss.backward()
     vopt.step()
-    return float(loss)
+    return loss.item()
 
 
 def slpo_backward(prompt_ids, comps, states, Rp, A_rloo, n_norm, vhead=None, vopt=None, use_value=False):
@@ -174,11 +197,22 @@ def grpo_backward(peft_model, prompt_ids, comps, adv, n_norm, beta):
 
 
 # ---------------- training loop ----------------
-def train_variant(peft_model, variant, train_items):
+@torch.no_grad()
+def greedy_acc(items):
+    """Greedy pass@1 and mean latent steps on GSM8K eval items (dropout off), active adapter."""
+    enc = [H.build_prompt(it["prompt"]) for it in items]
+    outs = H.generate_chunked(enc, CFG.r, CFG.max_new_tokens["gsm8k"], CFG.eval_batch_size)
+    acc = sum(bool(score_item("gsm8k", H.decode(o), it)) for o, it in zip(outs, items)) / max(1, len(items))
+    return acc, sum(len(o) for o in outs) * CFG.r / max(1, len(items))
+
+
+def train_variant(peft_model, variant, train_items, monitor_items=None):
     spec = VARIANTS[variant]
     is_slpo = spec["kind"] == "slpo"
     lam = CFG.step_cost_lambda if spec["lam"] is None else spec["lam"]
     use_scorer = spec.get("scorer", False)
+    random.seed(CFG.seed)              # every variant sees the same problems in the same order
+    torch.manual_seed(CFG.seed)
     if use_scorer and SCORER is None:
         log(f"skip {variant}: no latent scorer")
         return False
@@ -195,6 +229,11 @@ def train_variant(peft_model, variant, train_items):
     per_update = CFG.prompts_per_micro * CFG.grad_accum
     H.model.gradient_checkpointing = not is_slpo
     avg = lambda xs: sum(xs) / max(1, len(xs))  # noqa: E731
+    mon = monitor_items if (monitor_items and CFG.monitor_every) else None
+    if mon:
+        a0, s0_ = greedy_acc(mon)
+        hist.append(dict(update=0, mon_acc=a0, mon_steps=s0_))
+        log(f"[{variant}] monitor @0: held-out greedy acc={100 * a0:.1f}% latent steps={s0_:.0f} (n={len(mon)})")
 
     for epoch in range(CFG.num_epochs):
         order = random.sample(range(len(train_items)), len(train_items))
@@ -203,7 +242,7 @@ def train_variant(peft_model, variant, train_items):
             upd = [train_items[i] for i in order[u0:u0 + per_update]]
             n_norm = len(upd) * CFG.G
             use_value = vhead is not None and step >= CFG.value_warmup_updates
-            st = {k: [] for k in ("R", "acc", "T", "S", "kl", "lat", "tok", "vloss", "base")}
+            st = {k: [] for k in ("R", "acc", "T", "S", "kl", "lat", "tok", "vloss", "base", "informative")}
             opt.zero_grad(set_to_none=True)
 
             for m0 in range(0, len(upd), CFG.prompts_per_micro):
@@ -236,7 +275,12 @@ def train_variant(peft_model, variant, train_items):
                     st["T"] += [len(c) * CFG.r for c in comps]
 
                     nonempty = [g for g in range(CFG.G) if comps[g]]
-                    keep = nonempty if use_value else [g for g in nonempty if abs(A[g]) > 1e-8]
+                    informative = max(corr) > 0 or not CFG.skip_all_wrong
+                    st["informative"].append(float(informative))
+                    if not informative:      # all rollouts wrong: no policy update, V is still fit
+                        keep = []
+                    else:
+                        keep = nonempty if use_value else [g for g in nonempty if abs(A[g]) > 1e-8]
                     for s0 in range(0, len(nonempty if not keep else keep), CFG.loss_micro_bs):
                         if not keep:   # no policy signal: still fit V
                             if vhead is None:
@@ -260,10 +304,12 @@ def train_variant(peft_model, variant, train_items):
                     torch.cuda.empty_cache()
 
             gn = float(torch.nn.utils.clip_grad_norm_(params, CFG.max_grad_norm))
+            for pg in opt.param_groups:
+                pg["lr"] = CFG.lr * min(1.0, (step + 1) / max(1, CFG.lr_warmup_updates))
             opt.step()
             step += 1
             rec = dict(update=step, reward=avg(st["R"]), acc=avg(st["acc"]), steps=avg(st["T"]),
-                       grad_norm=gn, sec=time.time() - t0)
+                       grad_norm=gn, informative=avg(st["informative"]), sec=time.time() - t0)
             if is_slpo:
                 rec.update(lat=avg(st["lat"]), tok=avg(st["tok"]), base=avg(st["base"]), vloss=avg(st["vloss"]))
                 if use_scorer:
@@ -271,8 +317,10 @@ def train_variant(peft_model, variant, train_items):
             else:
                 rec["kl"] = avg(st["kl"])
                 beta = max(1e-4, beta * (1 + max(-0.2, min(0.2, rec["kl"] / CFG.kl_target - 1))))
+            if mon and step % CFG.monitor_every == 0:
+                rec["mon_acc"], rec["mon_steps"] = greedy_acc(mon)
             hist.append(rec)
-            log(f"[{variant}] " + " ".join(f"{k}={v:.4g}" for k, v in rec.items()))
+            log(f"[{variant}] ep{epoch} " + " ".join(f"{k}={v:.4g}" for k, v in rec.items()))
 
     H.model.gradient_checkpointing = False
     peft_model.save_pretrained(os.path.join(CFG.out_dir, f"lora_{variant}"), selected_adapters=[variant])
@@ -297,7 +345,9 @@ def evaluate(name, items, num_steps, tag):
             correct += ok
             steps += len(o) * num_steps
             records.append({"i": i, "correct": bool(ok), "steps": len(o) * num_steps, "output": txt})
-    res = {"acc": 100 * correct / max(1, len(items)), "steps": steps / max(1, len(items))}
+    records.sort(key=lambda r: r["i"])
+    res = {"acc": 100 * correct / max(1, len(items)), "steps": steps / max(1, len(items)),
+           "correct": [int(r["correct"]) for r in records], "steps_list": [r["steps"] for r in records]}
     with open(os.path.join(CFG.out_dir, f"eval_{tag}_{name}.jsonl"), "w") as f:
         f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
     log(f"== {tag} | {name} | r={num_steps} | acc={res['acc']:.2f} | steps={res['steps']:.0f}")
@@ -310,18 +360,113 @@ def print_table(results, cols):
         print(f"{name:<20}" + "".join(f"{res[c]['acc']:>14.2f} / {res[c]['steps']:>7.0f}" for c in cols))
 
 
+def paired_bootstrap(a, b, n_boot=2000, seed=0):
+    """mean(a - b) with a 95% paired-bootstrap CI (same eval items for both models)."""
+    rng, N = random.Random(seed), len(a)
+    if N == 0:
+        return 0.0, 0.0, 0.0
+    d = [x - y for x, y in zip(a, b)]
+    boots = sorted(sum(d[rng.randrange(N)] for _ in range(N)) / N for _ in range(n_boot))
+    return sum(d) / N, boots[int(0.025 * n_boot)], boots[int(0.975 * n_boot) - 1]
+
+
+def print_paper_table(results, cols):
+    """Paper baselines (copied) + rows measured in this run."""
+    cols = [c for c in ("gsm8k", "math", "mathqa") if c in cols]
+    print("\n" + "=" * 80 + "\nComparison with the LSRL paper baselines (pass@1 %)\n" + "=" * 80)
+    print(f"{'Model':<40}{'r':>4}" + "".join(f"{c:>9}" for c in cols))
+    for name, row in PAPER_BASELINES.items():
+        print(f"{name + ' [paper]':<40}{row['r']:>4}" + "".join(f"{row[c]:>9.2f}" for c in cols))
+    for name, res in results.items():
+        if not isinstance(res, dict) or not all(c in res and "acc" in res[c] for c in cols):
+            continue
+        r = CFG.r_deep if name.endswith(f"-r{CFG.r_deep}") else CFG.r
+        print(f"{name + ' [this run]':<40}{r:>4}" + "".join(f"{res[c]['acc']:>9.2f}" for c in cols))
+    n = CFG.eval_limit or "all"
+    print(f"[paper] rows are copied from the paper; [this run] rows use {n} test problems per dataset "
+          f"(--eval_limit 0 for full test sets).")
+
+
+def print_ablation(results, ablation, cols):
+    spec = ABLATIONS[ablation]
+    full, abl = f"{VARIANTS[FULL]['name']}-r{CFG.r}", f"{VARIANTS[spec['variant']]['name']}-r{CFG.r}"
+    if full not in results or abl not in results:
+        return None
+    print(f"\nABLATION [{ablation}]: {spec['title']}\n  {spec['question']}")
+    out = {}
+    for c in cols:
+        da = [100 * x for x in paired_bootstrap(results[full][c]["correct"], results[abl][c]["correct"])]
+        ds = list(paired_bootstrap(results[full][c]["steps_list"], results[abl][c]["steps_list"]))
+        out[c] = {"d_acc": da, "d_steps": ds}
+        print(f"  {c:<7} full - ablated: d_acc = {da[0]:+.2f} pts [{da[1]:+.2f}, {da[2]:+.2f}]   "
+              f"d_latent_steps = {ds[0]:+.0f} [{ds[1]:+.0f}, {ds[2]:+.0f}]  (95% paired bootstrap)")
+    return out
+
+
+def banner(text):
+    log("\n" + "#" * 80 + f"\n#  {text}\n" + "#" * 80)
+
+
+def select_train_items(gsm_train, perm):
+    if not CFG.filter_train:
+        return [gsm_train[i] for i in perm[:CFG.n_train]]
+    pool = perm[:CFG.filter_pool]
+    cache = os.path.join(CFG.out_dir, f"train_filter_seed{CFG.seed}_pool{CFG.filter_pool}_r{CFG.r}"
+                                      f"_tok{CFG.train_max_new_tokens}.json")
+    if os.path.exists(cache):
+        solved = json.load(open(cache))["solved"]
+        log(f"curriculum filter: loaded {len(solved)} solved problems from {cache}")
+    else:
+        log(f"curriculum filter: greedy pass of the base model over {len(pool)} GSM8K train problems (cached)")
+        enc = [H.build_prompt(gsm_train[i]["question"] + GSM_SUFFIX) for i in pool]
+        order = sorted(range(len(pool)), key=lambda j: len(enc[j]))
+        outs = [None] * len(pool)
+        for b in range(0, len(order), CFG.eval_batch_size):
+            idx = order[b:b + CFG.eval_batch_size]
+            res = H.generate_chunked([enc[j] for j in idx], CFG.r, CFG.train_max_new_tokens, CFG.eval_batch_size)
+            for j, o in zip(idx, res):
+                outs[j] = o
+        solved = [i for i, o in zip(pool, outs) if gsm_correct(H.decode(o), gsm_train[i]["answer"])]
+        json.dump({"pool": pool, "solved": solved}, open(cache, "w"))
+        log(f"curriculum filter: base model solves {len(solved)}/{len(pool)} ({100 * len(solved) / len(pool):.1f}%)")
+    chosen = solved[:CFG.n_train]
+    if len(chosen) < CFG.n_train:
+        solved_set = set(solved)
+        chosen += [i for i in pool if i not in solved_set][:CFG.n_train - len(chosen)]
+        log(f"curriculum filter: only {len(solved)} solved, topped up with unsolved problems")
+    return [gsm_train[i] for i in chosen]
+
+
 # ---------------- main ----------------
 def main():
     global CFG, SCORER
     ap = argparse.ArgumentParser()
-    ap.add_argument("--preset", default="paper", choices=["paper", "quick"])
+    ap.add_argument("--preset", default="colab", choices=["colab", "paper", "quick"])
     ap.add_argument("--variants", nargs="*", default=None, choices=list(VARIANTS))
+    ap.add_argument("--ablation", nargs="*", default=None, choices=list(ABLATIONS) + ["all"],
+                    help="train the full method + the ablated variant(s) and report the paired difference")
     ap.add_argument("--no_scorer", action="store_true")
     ap.add_argument("--scorer_path", default=None)
-    args = ap.parse_args()
+    ap.add_argument("--out_dir", default=None)
+    ap.add_argument("--eval_limit", type=int, default=None, help="0 = full test sets")
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--n_train", type=int, default=None)
+    ap.add_argument("--no_filter", action="store_true", help="train on random problems (no curriculum filter)")
+    args, _ = ap.parse_known_args()
     CFG = get_config(args.preset)
+    ablations = []
+    if args.ablation is not None:
+        ablations = list(ABLATIONS) if ("all" in args.ablation or not args.ablation) else args.ablation
+        CFG.train_variants = tuple(dict.fromkeys([FULL] + [ABLATIONS[a]["variant"] for a in ablations]))
     if args.variants is not None:
         CFG.train_variants = tuple(args.variants)
+    for k in ("out_dir", "lr", "n_train"):
+        if getattr(args, k) is not None:
+            setattr(CFG, k, getattr(args, k))
+    if args.eval_limit is not None:
+        CFG.eval_limit = args.eval_limit or None
+    if args.no_filter:
+        CFG.filter_train = False
     if args.no_scorer:
         CFG.use_scorer = False
     if args.scorer_path:
@@ -330,12 +475,17 @@ def main():
     random.seed(CFG.seed)
     torch.manual_seed(CFG.seed)
 
+    if H.DEVICE != "cuda":
+        raise SystemExit("ERROR: no GPU (torch.cuda.is_available() is False). In Colab: Runtime > Change runtime "
+                         "type > A100 or L4 GPU. Check with !nvidia-smi")
+    log(f"preset={CFG.preset} | variants={CFG.train_variants} | out_dir={CFG.out_dir}")
     H.load_model(CFG.model_id)
-    gsm_train, _ = load_gsm8k()
+    gsm_train, gsm_test = load_gsm8k()
     perm = random.Random(CFG.seed).sample(range(len(gsm_train)), len(gsm_train))
-    train_items = [gsm_train[i] for i in perm[:CFG.n_train]]
-    # scorer data is disjoint from the RL subset
-    rest = perm[CFG.n_train:]
+    train_items = select_train_items(gsm_train, perm)
+    monitor_items = make_eval_items("gsm8k", gsm_test)[-CFG.monitor_n:] if CFG.monitor_every else None
+    # scorer data is disjoint from the RL subset (and from the filter pool)
+    rest = perm[max(CFG.n_train, CFG.filter_pool if CFG.filter_train else 0):]
     scorer_train = [gsm_train[i] for i in rest[:CFG.scorer_n_train]]
     scorer_val = [gsm_train[i] for i in rest[CFG.scorer_n_train:CFG.scorer_n_train + CFG.scorer_n_val]]
     eval_sets = load_eval_sets(CFG.eval_datasets)
@@ -343,6 +493,7 @@ def main():
 
     results = {}
     run_eval = lambda tag, r: {n: evaluate(n, it, r, tag) for n, it in eval_sets.items()}  # noqa: E731
+    banner("STAGE 1: evaluate the untrained base model (reference)")
     if CFG.eval_sft_r8:
         results[f"SFT-r{CFG.r}"] = run_eval(f"sft_r{CFG.r}", CFG.r)
     if CFG.eval_sft_r32:
@@ -371,21 +522,26 @@ def main():
             peft_model.add_adapter(v, lcfg)
 
     for v in CFG.train_variants:
-        if not train_variant(peft_model, v, train_items):
+        banner(f"STAGE 2: RL TRAINING [{v}] -- {len(train_items)} problems x {CFG.num_epochs} epochs, G={CFG.G}")
+        if not train_variant(peft_model, v, train_items, monitor_items):
             continue
         peft_model.set_adapter(v)
+        banner(f"STAGE 3: evaluate the TRAINED model [{v}]")
         name = f"{VARIANTS[v]['name']}-r{CFG.r}"
         results[name] = run_eval(f"{v}_r{CFG.r}", CFG.r)
         if SCORER is not None and v in CFG.bon_after_variants:
             bon_results[name] = run_bon(f"{v}_r{CFG.r}")
 
     print_table({k: v for k, v in results.items() if k != "scorer_val"}, list(eval_sets))
+    print_paper_table(results, list(eval_sets))
+    abl_out = {a: print_ablation(results, a, list(eval_sets)) for a in ablations}
     if bon_results:
         print(f"\nBest-of-{CFG.bon_n} (scorer / majority / mean / oracle)")
         for name, res in bon_results.items():
             for n, r_ in res.items():
                 print(f"{name:<20}{n:>8}  " + "  ".join(f"{r_[k]:6.2f}" for k in ("scorer", "majority", "mean", "oracle")))
     results["best_of_n"] = bon_results
+    results["ablations"] = abl_out
     json.dump(results, open(os.path.join(CFG.out_dir, "results.json"), "w"), indent=2)
 
 

@@ -162,6 +162,13 @@ Evaluation uses greedy decoding with dropout off, and reports pass@1 and average
 | **`slpo_value_cost`** | **full method** | surrogate latent policy | $V_\phi$ | **0.1** |
 | `slpo_value_cost_scorer` | extension: + latent scorer reward | surrogate latent policy | $V_\phi$ | 0.1, $\eta = 0.2$ |
 
+Ablation-only variants (same reward as the full method, one component swapped):
+
+| Variant | Update | Baseline | Step cost $\lambda$ |
+|---|---|---|---|
+| `outcome_cost` | token-level GRPO | group mean | 0.1 |
+| `slpo_cost` | surrogate latent policy | RLOO | 0.1 |
+
 Reading the table: `slpo` vs `outcome` isolates latent-level updates, `slpo_value` vs `slpo` isolates the value baseline, `slpo_value_cost` vs `slpo_value` isolates the step cost (compare both accuracy and latent steps), and `slpo_value_cost_scorer` vs `slpo_value_cost` isolates the scorer reward.
 
 Latent scorer evaluation:
@@ -179,25 +186,76 @@ Shared settings:
 
 Evaluated on GSM8K, MathQA and MATH, with SFT-r8 / SFT-r32 as references.
 
+## Results
+
+### Main results (pass@1 %, Huginn-3.5B)
+
+Baseline rows are taken from LSRL ([Findings of EMNLP 2025](https://aclanthology.org/2025.findings-emnlp.669.pdf), Table 3).
+
+| Method | $r$ | GSM8K | MATH | MathQA | FLOPs / token |
+|---|---|---|---|---|---|
+| SFT-r8 | 8 | 13.49 | 5.61 | 24.07 | 1.0× |
+| RL-Outcome | 8 | 14.54 | 6.32 | 24.62 | 1.0× |
+| LSRL | 8 | 17.76 | 6.94 | 26.13 | 1.0× |
+| SFT-r32 (reference) | 32 | 24.87 | 11.24 | 27.97 | 4.0× |
+| **Ours (SLPO + $V_\phi$ + step cost)** | 8 | | | | 1.0× |
+
+### Ablations (GSM8K, pass@1 % and average latent steps $\bar T$)
+
+Each row removes one component of the full method. Δ = full method − ablation, with a 95% paired-bootstrap CI.
+
+| Variant | Removed component | Acc | $\bar T$ | Δ Acc | Δ $\bar T$ |
+|---|---|---|---|---|---|
+| **Full (`slpo_value_cost`)** | – | | | – | – |
+| `outcome_cost` | latent-level update → token-level GRPO | | | | |
+| `slpo_cost` | value baseline $V_\phi$ → RLOO | | | | |
+| `slpo_value` | step cost $\lambda = 0.1$ → 0 | | | | |
+
 ## Usage
+
+Colab: Runtime → Change runtime type → **A100** or **L4** GPU.
 
 ```bash
 !git clone https://github.com/tongyu0924/Learning-Latent-Process-Rewards-for-Efficient-Reasoning-with-Reinforcement-Learning
 %cd Learning-Latent-Process-Rewards-for-Efficient-Reasoning-with-Reinforcement-Learning
 !pip install -q -r requirements.txt
-!python train.py --preset quick                       # smoke test
-!python train.py                                      # full run
-!python train.py --variants slpo slpo_value           # subset of variants
-!python train.py --scorer_path outputs/latent_scorer.pt  # reuse a trained scorer
-!python train.py --no_scorer                          # skip the scorer entirely
+!python train.py --preset quick                       # smoke test (a few minutes)
+!python train.py                                      # full method, Colab-sized run (~2 h on A100)
+!python train.py --ablation all                       # full method + the 3 ablations
+!python train.py --ablation cost                      # one ablation: latent | value | cost
+!python train.py --eval_limit 0                       # evaluate on the full test sets
+!python train.py --preset paper                       # original settings, all variants (many GPU hours)
+!python train.py --preset paper --scorer_path outputs/latent_scorer.pt  # reuse a trained scorer
 ```
+
+Add `--out_dir /content/drive/MyDrive/slpo` (after mounting Drive) so results survive a disconnect.
+
+Every run prints three stages: (1) evaluate the untrained base model, (2) RL training, (3) evaluate the trained model.
+At the end it prints the results table next to the paper baselines and, with `--ablation`, the paired difference for each ablation.
+
+### Presets
+
+| | `colab` (default) | `paper` |
+|---|---|---|
+| training problems | 128 base-solvable (curriculum filter over 768) | 500 random |
+| epochs / updates | 2 / 32 | 1 / 16 |
+| lr | 3e-5, 3-step warmup | 2e-6 |
+| rollout temperature / MC-dropout | 0.7 / 0.05 | 1.0 / 0.1 |
+| max new tokens | 384 | 256 |
+| all-wrong rollout groups | skipped for the policy update | used |
+| eval | GSM8K, 300 problems | GSM8K, MathQA, MATH (full) |
+| latent scorer | off | on |
+
+The `colab` changes exist so a short run actually learns: with LoRA starting at $B = 0$, lr 2e-6 barely moves the weights in 32 updates, and at $r = 8$ the base model solves ~15% of GSM8K, so with $T = 1.0$ plus dropout on random problems most rollout groups are all-wrong and give no signal.
+During training, held-out greedy accuracy on 100 GSM8K test problems (disjoint from the reported 300) is logged as `mon_acc` every 8 updates.
 
 Outputs go to `outputs/`:
 
-- `results.json`
+- `results.json` (including `ablations`)
 - `train_*.json`: training logs
 - `eval_*.jsonl`: evaluation records
 - `bon_*.jsonl`: best-of-N records
+- `train_filter_*.json`: curriculum-filter cache
 - LoRA adapters, $V_\phi$ weights and `latent_scorer.pt`
 
 ## Files
